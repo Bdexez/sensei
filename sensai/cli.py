@@ -5,6 +5,7 @@ from datetime import datetime
 
 from .config import Config, ConfigError, load_config
 from .context import ContextBuilder
+from .memory.compressor import CompressionError, Compressor, Summary, compress
 from .memory.store import MemoryStore, Message
 from .memory.tokens import estimate_message
 from .ollama_client import ChatStats, ModelNotFound, OllamaClient, OllamaError, OllamaUnavailable
@@ -18,6 +19,8 @@ HELP = """Commandes :
   /profile set <clé> <val>   définir une info (ex. /profile set langue_cible japonais)
   /profile del <clé>         supprimer une info
   /context                   détail du dernier contexte envoyé
+  /summary                   afficher le résumé des anciens échanges
+  /compress                  forcer la compression des anciens échanges
   /quit                      quitter"""
 
 
@@ -26,9 +29,14 @@ class Chat:
         self.config = config
         self.store = store
         self.client = client
-        self.context = ContextBuilder(config.system_prompt, config.num_ctx, config.response_reserve)
+        self.context = ContextBuilder(
+            config.system_prompt, config.num_ctx, config.response_reserve, summary_share=config.summary_share
+        )
+        self.compressor = Compressor(client, config.compress_trigger, config.compress_keep)
         self.session_id = store.create_session(config.user)
-        self.history: list[Message] = []
+        self.history: list[Message] = []  # unsummarized turns only
+        self.summary: Summary | None = None
+        self.compress_backoff = 0  # turns to wait after a failed compression
         self.last_report = None
 
     def handle_command(self, line: str) -> bool:
@@ -43,6 +51,7 @@ class Chat:
         elif cmd == "/new":
             self.session_id = self.store.create_session(user)
             self.history = []
+            self.summary = None
             print(f"Nouvelle session #{self.session_id}")
         elif cmd == "/sessions":
             for s in self.store.list_sessions(user):
@@ -56,12 +65,23 @@ class Chat:
                 print(f"Session #{parts[1]} introuvable")
             else:
                 self.session_id = int(parts[1])
-                self.history = self.store.load_messages(self.session_id)
-                print(f"Session #{self.session_id} rechargée ({len(self.history)} messages)")
+                saved = self.store.get_summary(self.session_id)
+                self.summary = Summary.from_json(saved[0]) if saved else None
+                self.history = self.store.load_messages(self.session_id, after_id=saved[1] if saved else 0)
+                total = self.store.count_messages(self.session_id)
+                print(
+                    f"Session #{self.session_id} rechargée ({total} messages, "
+                    f"dont {total - len(self.history)} résumés)"
+                )
         elif cmd == "/profile":
             self._profile(parts[1:])
         elif cmd == "/context":
             self._print_report()
+        elif cmd == "/summary":
+            print(self.summary.render() if self.summary else "Aucun résumé pour cette session.")
+        elif cmd == "/compress":
+            if not self._compress(force=True):
+                print("Rien à compresser (il faut au moins 2 messages en dehors des plus récents).")
         else:
             print(f"Commande inconnue : {cmd} (voir /help)")
         return True
@@ -89,16 +109,59 @@ class Chat:
             return
         print(
             f"Budget {r.used}/{r.budget} tokens (estimés) — système+profil {r.system_tokens}, "
-            f"RAG {r.rag_tokens}, historique {r.history_tokens} "
+            f"résumé {r.summary_tokens}/{self.context.summary_cap}, RAG {r.rag_tokens}, "
+            f"historique {r.history_tokens}/{self.context.history_budget(self.store.get_profile(self.config.user))} "
             f"({r.history_kept} messages gardés, {r.history_dropped} écartés)"
         )
+        s = self.store.compression_stats(self.session_id)
+        if s["passes"]:
+            print(
+                f"Compressions : {s['ok']}/{s['passes']} réussies, {s['messages']} messages résumés, "
+                f"~{s['saved']} tokens économisés, {s['avg_ms']:.0f} ms en moyenne"
+            )
+
+    def _compress(self, force: bool = False) -> bool:
+        """Summarize old turns if needed; return True if something was compressed."""
+        available = self.context.history_budget(self.store.get_profile(self.config.user))
+        done = False
+        while chunk := self.compressor.select(self.history, available, force=force and not done):
+            print(f"[compression de {len(chunk)} anciens messages…]", file=sys.stderr)
+            try:
+                result = compress(self.compressor, chunk, self.summary, self.context.summary_cap)
+            except CompressionError as exc:
+                self.store.log_compression(self.session_id, len(chunk), 0, 0, 0, error=str(exc))
+                self.compress_backoff = 3
+                print(f"[compression échouée : {exc} — les plus vieux messages seront écartés]", file=sys.stderr)
+                return done
+            self.summary = result.summary
+            self.store.set_summary(self.session_id, result.summary.to_json(), result.covered_until, result.tokens_after)
+            self.store.log_compression(
+                self.session_id, result.messages_in, result.tokens_before, result.tokens_after, result.duration_ms
+            )
+            self.history = self.history[len(chunk):]
+            done = True
+            print(
+                f"[{result.tokens_before} → {result.tokens_after} tokens en {result.duration_ms / 1000:.1f} s"
+                + (f", {result.dropped_items} éléments anciens retirés du résumé" if result.dropped_items else "")
+                + "]",
+                file=sys.stderr,
+            )
+        return done
 
     def send(self, text: str) -> None:
         user_msg = Message("user", text, estimate_message(text))
         self.history.append(user_msg)
         self.store.add_message(self.session_id, user_msg)
 
-        messages, self.last_report = self.context.build(self.store.get_profile(self.config.user), self.history)
+        if self.config.compression:
+            if self.compress_backoff:
+                self.compress_backoff -= 1
+            else:
+                self._compress()
+        summary = self.summary.render() if self.summary and not self.summary.is_empty() else None
+        messages, self.last_report = self.context.build(
+            self.store.get_profile(self.config.user), self.history, summary
+        )
         if self.last_report.history_dropped:
             print(f"[{self.last_report.history_dropped} anciens messages hors contexte]", file=sys.stderr)
 

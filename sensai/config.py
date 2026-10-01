@@ -18,6 +18,11 @@ class Config:
     db_path: str = "data/sensai.db"
     user: str = "default"
     system_prompt: str = "You are Sensai, a friendly language tutor."
+    # M2: compression of old turns
+    compression: bool = True
+    compress_trigger: float = 0.8
+    compress_keep: float = 0.4
+    summary_share: float = 0.1
 
 
 class ConfigError(Exception):
@@ -53,6 +58,9 @@ def load_config(argv: list[str] | None = None) -> Config:
         if getattr(args, key) is not None:
             values[key] = getattr(args, key)
     config = Config(**values)
-    if not 0 < config.response_reserve < 1:
-        raise ConfigError("response_reserve must be between 0 and 1")
+    for key in ("response_reserve", "compress_trigger", "compress_keep", "summary_share"):
+        if not 0 < getattr(config, key) < 1:
+            raise ConfigError(f"{key} must be between 0 and 1")
+    if config.compress_keep >= config.compress_trigger:
+        raise ConfigError("compress_keep must be lower than compress_trigger")
     return config

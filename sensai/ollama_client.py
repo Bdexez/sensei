@@ -47,16 +47,42 @@ class OllamaClient:
         if self.model not in names and f"{self.model}:latest" not in names:
             raise ModelNotFound(f"model '{self.model}' not found; pull it with `ollama pull {self.model}`")
 
-    def chat_stream(self, messages: list[dict], stats: ChatStats) -> Iterator[str]:
-        """Yield response text pieces as they arrive; fill `stats` when done."""
+    def _payload(self, messages: list[dict], stream: bool, options: dict | None = None) -> dict:
         payload = {
             "model": self.model,
             "messages": messages,
-            "stream": True,
-            "options": {"num_ctx": self.num_ctx},
+            "stream": stream,
+            "options": {"num_ctx": self.num_ctx, **(options or {})},
         }
         if self.think is not None:
             payload["think"] = self.think
+        return payload
+
+    def chat(self, messages: list[dict], stats: ChatStats, schema: dict | None = None, options: dict | None = None) -> str:
+        """Non-streaming call; with `schema`, Ollama constrains the output to that JSON schema."""
+        payload = self._payload(messages, stream=False, options=options)
+        if schema is not None:
+            payload["format"] = schema
+        try:
+            resp = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise OllamaUnavailable(f"connection to Ollama failed: {exc}") from exc
+        if resp.status_code != 200:
+            raise self._error_from(resp)
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise OllamaError(f"unreadable response from Ollama: {exc}") from exc
+        if "error" in data:
+            raise OllamaError(data["error"])
+        stats.prompt_eval_count = data.get("prompt_eval_count", 0)
+        stats.eval_count = data.get("eval_count", 0)
+        stats.total_duration_ms = data.get("total_duration", 0) / 1e6
+        return data.get("message", {}).get("content", "")
+
+    def chat_stream(self, messages: list[dict], stats: ChatStats) -> Iterator[str]:
+        """Yield response text pieces as they arrive; fill `stats` when done."""
+        payload = self._payload(messages, stream=True)
         try:
             resp = requests.post(f"{self.host}/api/chat", json=payload, stream=True, timeout=self.timeout)
         except requests.RequestException as exc:

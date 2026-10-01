@@ -33,6 +33,26 @@ CREATE TABLE IF NOT EXISTS profile (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (user, key)
 );
+-- M2: one rolling summary per session, covering every message up to covered_until.
+CREATE TABLE IF NOT EXISTS summaries (
+    session_id     INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    content        TEXT NOT NULL,
+    covered_until  INTEGER NOT NULL,
+    tokens         INTEGER NOT NULL,
+    updated_at     REAL NOT NULL
+);
+-- M2 metrics: one row per compression pass.
+CREATE TABLE IF NOT EXISTS compressions (
+    id                 INTEGER PRIMARY KEY,
+    session_id         INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    messages_in        INTEGER NOT NULL,
+    tokens_before      INTEGER NOT NULL,
+    tokens_after       INTEGER NOT NULL,
+    duration_ms        REAL NOT NULL,
+    ok                 INTEGER NOT NULL,
+    error              TEXT,
+    created_at         REAL NOT NULL
+);
 """
 
 
@@ -41,6 +61,7 @@ class Message:
     role: str
     content: str
     tokens: int | None = None
+    id: int | None = None
 
     def to_ollama(self) -> dict:
         return {"role": self.role, "content": self.content}
@@ -97,12 +118,14 @@ class MemoryStore:
     # --- messages -------------------------------------------------------
 
     def add_message(self, session_id: int, msg: Message) -> None:
+        """Insert `msg` and set its id."""
         now = time.time()
         with self.conn:
-            self.conn.execute(
+            cur = self.conn.execute(
                 "INSERT INTO messages (session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?)",
                 (session_id, msg.role, msg.content, msg.tokens, now),
             )
+            msg.id = cur.lastrowid
             self.conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, session_id))
             if msg.role == "user":
                 # First user message becomes the session title.
@@ -111,11 +134,63 @@ class MemoryStore:
                     (msg.content[:60], session_id),
                 )
 
-    def load_messages(self, session_id: int) -> list[Message]:
+    def load_messages(self, session_id: int, after_id: int = 0) -> list[Message]:
         rows = self.conn.execute(
-            "SELECT role, content, tokens FROM messages WHERE session_id = ? ORDER BY id", (session_id,)
+            "SELECT id, role, content, tokens FROM messages WHERE session_id = ? AND id > ? ORDER BY id",
+            (session_id, after_id),
         ).fetchall()
-        return [Message(r["role"], r["content"], r["tokens"]) for r in rows]
+        return [Message(r["role"], r["content"], r["tokens"], r["id"]) for r in rows]
+
+    def count_messages(self, session_id: int) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM messages WHERE session_id = ?", (session_id,)).fetchone()
+        return row["n"]
+
+    # --- rolling summary (M2) -------------------------------------------
+
+    def get_summary(self, session_id: int) -> tuple[str, int] | None:
+        """Return (content, covered_until) or None."""
+        row = self.conn.execute(
+            "SELECT content, covered_until FROM summaries WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return (row["content"], row["covered_until"]) if row else None
+
+    def set_summary(self, session_id: int, content: str, covered_until: int, tokens: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO summaries (session_id, content, covered_until, tokens, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT (session_id) DO UPDATE SET content = excluded.content,
+                   covered_until = excluded.covered_until, tokens = excluded.tokens,
+                   updated_at = excluded.updated_at""",
+                (session_id, content, covered_until, tokens, time.time()),
+            )
+
+    def log_compression(
+        self,
+        session_id: int,
+        messages_in: int,
+        tokens_before: int,
+        tokens_after: int,
+        duration_ms: float,
+        error: str | None = None,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO compressions (session_id, messages_in, tokens_before, tokens_after,
+                   duration_ms, ok, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, messages_in, tokens_before, tokens_after, duration_ms, error is None, error, time.time()),
+            )
+
+    def compression_stats(self, session_id: int) -> dict:
+        row = self.conn.execute(
+            """SELECT COUNT(*) AS passes, COALESCE(SUM(ok), 0) AS ok,
+                      COALESCE(SUM(CASE WHEN ok THEN messages_in END), 0) AS messages,
+                      COALESCE(SUM(CASE WHEN ok THEN tokens_before - tokens_after END), 0) AS saved,
+                      COALESCE(AVG(CASE WHEN ok THEN duration_ms END), 0) AS avg_ms
+               FROM compressions WHERE session_id = ?""",
+            (session_id,),
+        ).fetchone()
+        return dict(row)
 
     # --- learner profile ------------------------------------------------
 

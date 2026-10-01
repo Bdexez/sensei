@@ -7,11 +7,14 @@ and decides what goes in.
 
 Priority order:
   1. system prompt + learner profile      (always included)
-  2. retrieved documents (RAG hook)       (capped share of the budget)
-  3. recent history, newest first         (whatever is left)
+  2. rolling summary of old turns (M2)    (capped share of the budget)
+  3. retrieved documents (RAG hook)       (capped share of the budget)
+  4. recent history, newest first         (whatever is left)
 A share of num_ctx is kept free for the model's answer.
 
-TODO(M2): summarize the turns that no longer fit instead of dropping them.
+The history should normally fit thanks to compression (memory/compressor.py);
+dropping the oldest turns is only the fallback when compression fails.
+
 TODO(M3): inject relevant learner facts (vocabulary, recurring errors).
 """
 
@@ -32,6 +35,7 @@ class ContextReport:
     budget: int
     used: int = 0
     system_tokens: int = 0
+    summary_tokens: int = 0
     rag_tokens: int = 0
     history_tokens: int = 0
     history_kept: int = 0
@@ -47,19 +51,40 @@ class ContextBuilder:
         response_reserve: float,
         retriever: Retriever | None = None,
         rag_share: float = 0.25,
+        summary_share: float = 0.1,
     ):
         self.system_prompt = system_prompt
         self.budget = int(num_ctx * (1 - response_reserve))
         self.retriever = retriever
         self.rag_share = rag_share
+        self.summary_share = summary_share
 
-    def build(self, profile: dict[str, str], history: list[Message]) -> tuple[list[dict], ContextReport]:
-        """`history` ends with the current user message."""
+    @property
+    def summary_cap(self) -> int:
+        return int(self.budget * self.summary_share)
+
+    def history_budget(self, profile: dict[str, str]) -> int:
+        """Tokens left for raw history once every other section has its full share."""
+        reserved = estimate_message(self._system_message(profile)) + self.summary_cap
+        if self.retriever:
+            reserved += int(self.budget * self.rag_share)
+        return max(0, self.budget - reserved)
+
+    def build(
+        self, profile: dict[str, str], history: list[Message], summary: str | None = None
+    ) -> tuple[list[dict], ContextReport]:
+        """`history` holds the unsummarized turns and ends with the current user message."""
         report = ContextReport(budget=self.budget)
 
         system = self._system_message(profile)
         report.system_tokens = estimate_message(system)
         remaining = self.budget - report.system_tokens
+
+        if summary:
+            system += f"\n\n{summary}"
+            report.summary_tokens = estimate_message(summary)
+            remaining -= report.summary_tokens
+            report.sections.append("summary")
 
         if self.retriever and history:
             chunks = self.retriever(history[-1].content, int(self.budget * self.rag_share))
