@@ -1,11 +1,14 @@
 """Interactive CLI loop."""
 
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 
 from .config import Config, ConfigError, load_config
 from .context import ContextBuilder
 from .memory.compressor import CompressionError, Compressor, Summary, compress
+from .memory.extractor import ExtractionError, MemoryExtractor
+from .memory.learner import LearnerMemory
 from .memory.store import MemoryStore, Message
 from .memory.tokens import estimate_message
 from .ollama_client import ChatStats, ModelNotFound, OllamaClient, OllamaError, OllamaUnavailable
@@ -21,6 +24,10 @@ HELP = """Commandes :
   /context                   détail du dernier contexte envoyé
   /summary                   afficher le résumé des anciens échanges
   /compress                  forcer la compression des anciens échanges
+  /vocab                     vocabulaire appris (révision espacée)
+  /vocab del <mot>           oublier un mot
+  /mistakes                  erreurs récurrentes
+  /memory                    bloc mémoire injecté au dernier message
   /quit                      quitter"""
 
 
@@ -30,14 +37,33 @@ class Chat:
         self.store = store
         self.client = client
         self.context = ContextBuilder(
-            config.system_prompt, config.num_ctx, config.response_reserve, summary_share=config.summary_share
+            config.system_prompt,
+            config.num_ctx,
+            config.response_reserve,
+            summary_share=config.summary_share,
+            memory_share=config.memory_share,
         )
         self.compressor = Compressor(client, config.compress_trigger, config.compress_keep)
         self.session_id = store.create_session(config.user)
         self.history: list[Message] = []  # unsummarized turns only
         self.summary: Summary | None = None
         self.compress_backoff = 0  # turns to wait after a failed compression
+        self.learner = LearnerMemory(store.conn)
+        self.extractor = MemoryExtractor(client)
+        # Extraction runs in the background while the learner reads the answer;
+        # only the model call happens there, results are applied on this thread.
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.pending: Future | None = None
+        self.last_memory: str | None = None
         self.last_report = None
+
+    @property
+    def language(self) -> str:
+        return self.store.get_profile(self.config.user).get("langue_cible", "")
+
+    def close(self) -> None:
+        self._apply_pending()
+        self.executor.shutdown()
 
     def handle_command(self, line: str) -> bool:
         """Return False to quit."""
@@ -82,6 +108,27 @@ class Chat:
         elif cmd == "/compress":
             if not self._compress(force=True):
                 print("Rien à compresser (il faut au moins 2 messages en dehors des plus récents).")
+        elif cmd == "/vocab":
+            self._apply_pending()
+            if len(parts) >= 3 and parts[1] == "del":
+                word = line.split(maxsplit=2)[2]
+                print("Oublié" if self.learner.delete_word(user, self.language, word) else "Mot absent")
+            else:
+                words = self.learner.words(user, self.language)
+                if not words:
+                    print("Aucun mot enregistré pour l'instant.")
+                for w in words:
+                    when = datetime.fromtimestamp(w.next_review).strftime("%Y-%m-%d")
+                    print(f"  [boîte {w.box}] {w.line()}  — révision {when}")
+        elif cmd == "/mistakes":
+            self._apply_pending()
+            mistakes = self.learner.mistakes(user, self.language, limit=50)
+            if not mistakes:
+                print("Aucune erreur enregistrée.")
+            for m in mistakes:
+                print(f"  {m.line()}")
+        elif cmd == "/memory":
+            print(self.last_memory or "Aucun bloc mémoire injecté au dernier message.")
         else:
             print(f"Commande inconnue : {cmd} (voir /help)")
         return True
@@ -113,6 +160,13 @@ class Chat:
             f"historique {r.history_tokens}/{self.context.history_budget(self.store.get_profile(self.config.user))} "
             f"({r.history_kept} messages gardés, {r.history_dropped} écartés)"
         )
+        print(f"Mémoire de l'apprenant {r.memory_tokens}/{self.context.memory_cap}")
+        o = self.learner.op_stats(self.config.user)
+        if o["total"]:
+            print(
+                f"Opérations mémoire : {o['applied']}/{o['total']} appliquées, "
+                f"{o['failed_extractions']} extractions échouées"
+            )
         s = self.store.compression_stats(self.session_id)
         if s["passes"]:
             print(
@@ -148,7 +202,36 @@ class Chat:
             )
         return done
 
+    def _apply_pending(self) -> None:
+        """Wait for the background extraction of the previous exchange and apply it."""
+        if self.pending is None:
+            return
+        future, self.pending = self.pending, None
+        user = self.config.user
+        try:
+            ops = future.result()
+        except ExtractionError as exc:
+            self.learner.log_failure(user, self.session_id, str(exc))
+            print(f"[mémoire : extraction échouée ({exc})]", file=sys.stderr)
+            return
+        if not ops:
+            return
+        report = self.learner.apply(user, self.language, ops, self.store.set_profile, self.session_id)
+        print(f"[mémoire : {report.short()}]", file=sys.stderr)
+
+    def _start_extraction(self, user_text: str, answer: str) -> None:
+        user = self.config.user
+        language = self.language
+        profile = self.store.get_profile(user)
+        exchange = f"{user_text}\n{answer}"
+        known_words = self.learner.mentioned_words(user, language, exchange, limit=20)
+        known_mistakes = self.learner.mistakes(user, language, limit=10)
+        self.pending = self.executor.submit(
+            self.extractor.extract, user_text, answer, profile, known_words, known_mistakes
+        )
+
     def send(self, text: str) -> None:
+        self._apply_pending()
         user_msg = Message("user", text, estimate_message(text))
         self.history.append(user_msg)
         self.store.add_message(self.session_id, user_msg)
@@ -159,8 +242,13 @@ class Chat:
             else:
                 self._compress()
         summary = self.summary.render() if self.summary and not self.summary.is_empty() else None
+        self.last_memory = (
+            self.learner.render(self.config.user, self.language, text, self.context.memory_cap)
+            if self.config.memory
+            else None
+        )
         messages, self.last_report = self.context.build(
-            self.store.get_profile(self.config.user), self.history, summary
+            self.store.get_profile(self.config.user), self.history, summary, self.last_memory
         )
         if self.last_report.history_dropped:
             print(f"[{self.last_report.history_dropped} anciens messages hors contexte]", file=sys.stderr)
@@ -180,6 +268,8 @@ class Chat:
             msg = Message("assistant", answer, stats.eval_count or estimate_message(answer))
             self.history.append(msg)
             self.store.add_message(self.session_id, msg)
+            if self.config.memory:
+                self._start_extraction(text, answer)
 
 
 def run(config: Config) -> int:
@@ -221,6 +311,7 @@ def run(config: Config) -> int:
     except KeyboardInterrupt:
         print()
     finally:
+        chat.close()
         store.close()
     return 0
 

@@ -10,7 +10,7 @@ Features du catalogue concernées :
 |---|---|---|
 | M1 | Session Persistence & Profiles | ✅ fait |
 | M2 | Token Budgeting & Semantic Compression | ✅ fait (métriques à mesurer avec le vrai modèle) |
-| M3 | External Structured Memory | ⏳ à faire |
+| M3 | External Structured Memory | ✅ fait (métriques à mesurer avec le vrai modèle) |
 | M4 | Artifact & State Document | ❌ pas prévu pour l'instant |
 
 ---
@@ -47,11 +47,14 @@ sensai/
   context.py          # ContextBuilder : assemble le prompt dans le budget
   cli.py              # boucle de chat et commandes
   memory/
-    store.py          # SQLite : sessions, messages, profil (M1), résumés (M2) — accueillera M3
+    store.py          # SQLite : sessions, messages, profil (M1), résumés (M2)
     tokens.py         # estimation du nombre de tokens
     compressor.py     # compression des vieux tours en résumé structuré (M2)
+    learner.py        # vocabulaire, erreurs, journal des opérations (M3)
+    extractor.py      # le modèle choisit les opérations mémoire après chaque échange (M3)
 benchmarks/
   m2_recall.py        # banc de test : rappel des faits avec / sans compression
+  m3_extraction.py    # banc de test : qualité des opérations mémoire proposées
 ```
 
 Déroulement d'un tour :
@@ -59,20 +62,25 @@ Déroulement d'un tour :
 ```
 saisie utilisateur
    │
+   ├─► application des opérations mémoire de l'échange précédent (M3)
+   │
    ├─► sauvegarde du message en base (store.add_message)
    │
    ├─► compression si l'historique approche de sa part du budget (M2)
    │      les plus vieux tours → résumé structuré, sauvegardé en base
    │
-   ├─► ContextBuilder.build(profil, historique non résumé, résumé)
+   ├─► ContextBuilder.build(profil, historique non résumé, résumé, mémoire)
    │      1. prompt système + profil          (toujours inclus)
-   │      2. résumé des anciens tours         (part plafonnée du budget)
-   │      3. documents RAG                    (part plafonnée du budget)
-   │      4. historique, du plus récent au plus ancien, tant qu'il reste de la place
+   │      2. mémoire de l'apprenant (M3)      (part plafonnée du budget)
+   │      3. résumé des anciens tours         (part plafonnée du budget)
+   │      4. documents RAG                    (part plafonnée du budget)
+   │      5. historique, du plus récent au plus ancien, tant qu'il reste de la place
    │
    ├─► Ollama /api/chat en streaming → affichage progressif
    │
-   └─► sauvegarde de la réponse + nombre réel de tokens (eval_count)
+   ├─► sauvegarde de la réponse + nombre réel de tokens (eval_count)
+   │
+   └─► extraction des opérations mémoire en arrière-plan (M3)
 ```
 
 ---
@@ -92,9 +100,12 @@ Avec la config par défaut : `8192 × (1 − 0.2) = 6553` tokens pour le prompt.
 | Priorité | Contenu | Règle |
 |---|---|---|
 | 1 | Prompt système + profil apprenant | Toujours inclus |
-| 2 | Résumé des anciens tours (M2) | Au plus 10 % du budget (`summary_share`) |
-| 3 | Documents RAG | Au plus 25 % du budget (`rag_share`) |
-| 4 | Historique non résumé | Ce qui reste, en partant du message le plus récent |
+| 2 | Mémoire de l'apprenant (M3) | Au plus 10 % du budget (`memory_share`) |
+| 3 | Résumé des anciens tours (M2) | Au plus 10 % du budget (`summary_share`) |
+| 4 | Documents RAG | Au plus 25 % du budget (`rag_share`) |
+| 5 | Historique non résumé | Ce qui reste, en partant du message le plus récent |
+
+Avec la config par défaut (8192 tokens) : réserve pour la réponse 1639, mémoire ≤ 655, résumé ≤ 655, RAG ≤ 1638, et environ 3 500 tokens pour l'historique (environ 5 100 tant que le RAG n'est pas branché).
 
 La **part de l'historique** (`history_budget`) est ce qui reste une fois que toutes les autres sections ont reçu leur part maximale. C'est cette valeur que le compresseur surveille.
 
@@ -112,6 +123,8 @@ Chaque construction produit un `ContextReport`, visible avec la commande `/conte
 
 ```
 Budget 594/960 tokens (estimés) — système+profil 103, résumé 74/96, RAG 0, historique 417/761 (13 messages gardés, 0 écartés)
+Mémoire de l'apprenant 85/96
+Opérations mémoire : 6/7 appliquées, 1 extractions échouées
 Compressions : 2/2 réussies, 16 messages résumés, ~445 tokens économisés, 1 ms en moyenne
 ```
 
@@ -295,7 +308,126 @@ Il affiche un tableau Markdown (rappel, tokens de prompt moyens, nombre et duré
 
 ---
 
-## 7. Utilisation
+## 7. Mémoire structurée de l'apprenant — M3 (`memory/learner.py`, `memory/extractor.py`)
+
+Le résumé de M2 garde le fil d'**une** session. M3 garde ce que l'apprenant sait **sur la durée, toutes sessions confondues** : les mots vus, quand les réviser, et les erreurs qui reviennent. C'est la « mémoire de prof » d'un Duolingo.
+
+### Les données
+
+```sql
+vocabulary (user, language, word, translation, box, correct, wrong, next_review, created_at, updated_at)
+           -- unique (user, language, word)
+mistakes   (user, language, pattern, correction, example, count, last_seen)
+           -- unique (user, language, pattern)
+memory_ops (user, session_id, op, payload, applied, error, created_at)
+```
+
+- La langue vient du profil (`langue_cible`). Un apprenant qui étudie deux langues a deux vocabulaires séparés.
+- Mots et erreurs sont stockés en minuscules, avec les espaces normalisés : « Inu » et « inu » sont le même mot, et une erreur déjà vue voit son compteur augmenter au lieu d'être dupliquée.
+- `memory_ops` journalise **chaque opération proposée par le modèle**, acceptée ou rejetée, avec la raison du rejet. On peut toujours expliquer pourquoi la mémoire contient quelque chose.
+
+### Révision espacée (système de Leitner)
+
+Chaque mot est dans une « boîte » de 0 à 5. La boîte décide quand le mot doit être révisé :
+
+| Boîte | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| Prochaine révision | tout de suite | 1 jour | 3 jours | 7 jours | 14 jours | 30 jours |
+
+- Bonne réponse : le mot monte d'une boîte.
+- Mauvaise réponse : le mot retombe en boîte 0.
+- Un mot est considéré comme **maîtrisé** à partir de la boîte 4.
+
+Leitner plutôt que SM-2 (l'algorithme d'Anki) : il est plus simple à expliquer, il n'a besoin que de « juste / faux » (ce qu'un modèle 4B sait juger de façon fiable), et il suffit pour la démo.
+
+### Écriture : c'est le modèle qui décide, le code qui applique
+
+Après chaque échange, un appel séparé au modèle lit le message de l'apprenant, la réponse du tuteur, le profil, ainsi que les mots et erreurs déjà connus. Il renvoie une liste d'opérations, en JSON imposé par un schéma :
+
+| Opération | Champs | Effet |
+|---|---|---|
+| `add_word` | word, translation | Ajoute un mot (ou met à jour sa traduction) |
+| `review_word` | word, correct, (translation) | Fait monter ou redescendre le mot dans les boîtes de Leitner |
+| `delete_word` | word | Oublie un mot |
+| `add_mistake` | pattern, correction, (example) | Ajoute une erreur, ou augmente son compteur |
+| `resolve_mistake` | pattern | Retire une erreur que l'apprenant maîtrise désormais |
+| `set_profile` | key, value | Complète le profil (langue, niveau, objectif…) |
+
+C'est ce qui fait de M3 une mémoire **pilotée par l'agent** : le modèle choisit lui-même de créer, modifier ou supprimer des entrées. Avant toute écriture, le code vérifie chaque opération :
+
+- type d'opération connu, champs obligatoires présents, textes de moins de 200 caractères, `correct` bien booléen ;
+- `review_word` sur un mot inconnu : accepté seulement si une traduction est fournie (le mot est alors créé) ;
+- `delete_word` ou `resolve_mistake` sur quelque chose qui n'existe pas : rejeté ;
+- au plus 12 opérations par échange.
+
+Une opération invalide est **rejetée et journalisée**, sans bloquer les autres.
+
+Pour que le modèle réutilise exactement le même texte (et que les compteurs augmentent au lieu de créer des doublons), on lui donne les mots connus présents dans l'échange et les 10 erreurs les plus fréquentes.
+
+### Choix techniques
+
+**Un appel séparé plutôt que des appels d'outils pendant la réponse.**
+On aurait pu laisser le tuteur appeler des outils (« enregistre ce mot ») en pleine réponse. On ne l'a pas fait :
+- le tuteur reste concentré sur l'enseignement, et sa réponse continue de s'afficher progressivement ;
+- un modèle 4B est bien plus fiable sur une seule tâche d'extraction étroite que pour décider en pleine réponse quand appeler un outil ;
+- le schéma JSON garantit une sortie lisible par le code.
+
+**L'extraction tourne en arrière-plan.**
+Elle démarre dès que la réponse est affichée, dans un fil séparé, pendant que l'apprenant lit et tape. Ses opérations sont appliquées au début du message suivant (ou en quittant). Seul l'appel au modèle tourne en arrière-plan : la base SQLite n'est touchée que par le fil principal, ce qui évite les problèmes d'accès concurrent.
+
+**La lecture est faite par le code, pas par le modèle.**
+Choisir quoi injecter est déterministe : pas besoin d'un appel au modèle pour « chercher » dans la mémoire.
+
+### Lecture : ce qui est injecté dans le contexte
+
+À chaque message, `LearnerMemory.render()` construit un bloc ajouté au message système. Il est rempli par priorité, ligne par ligne, jusqu'à `memory_share` du budget :
+
+1. **Mots présents dans le message** de l'apprenant (recherche par mot entier, pour que « inu » ne soit pas trouvé dans « inutile » ; par sous-chaîne pour le japonais et le chinois, qui s'écrivent sans espaces) ;
+2. **Mots à réviser** (`next_review` dépassé), les plus fragiles d'abord ;
+3. **Erreurs les plus fréquentes**.
+
+```
+## Mémoire de l'apprenant (japonais)
+3 mots vus, 0 maîtrisés.
+
+### Mots présents dans le message
+- inu = chien (2 ✔ / 0 ✘)
+
+### Mots à réviser
+- neko = chat (0 ✔ / 1 ✘)
+
+### Erreurs fréquentes
+- confond wa et ga → wa = thème, ga = sujet (vue 2 fois) — ex. « watashi ga Camille desu »
+
+Réutilise les mots à réviser dans tes exercices et surveille les erreurs fréquentes.
+```
+
+La dernière ligne demande au tuteur d'utiliser cette mémoire : c'est ce qui transforme le chatbot en prof qui fait réviser au bon moment.
+
+### Lien avec M2
+
+Le résumé de M2 contient aussi des listes `vocabulaire` et `erreurs`. Il y a un recoupement assumé : le résumé sert au fil de **la session en cours**, M3 à la mémoire **à long terme**. Comme M3 garde tout en base, le résumé peut retirer ses vieux mots et vieilles erreurs quand il manque de place sans que rien ne soit perdu.
+
+### En cas d'échec
+
+Si l'extraction échoue (JSON invalide, Ollama indisponible), l'échec est journalisé (`op = 'extract'`) et signalé dans le terminal, et la conversation continue normalement. Seules les opérations de cet échange sont perdues.
+
+### Mesurer : le banc de test d'extraction
+
+`benchmarks/m3_extraction.py` fait tourner l'extraction sur 7 échanges écrits à la main dont on connaît les bonnes opérations (nouveau mot, bonne et mauvaise réponse, erreur de particule, infos de profil, demande d'oubli, échange sans rien à retenir). Il mesure :
+
+- la **précision** : part des opérations proposées qui étaient attendues ;
+- le **rappel** : part des opérations attendues qui ont été proposées ;
+- le nombre d'opérations que la validation **rejetterait** ;
+- le nombre d'**extractions échouées** (JSON invalide).
+
+```bash
+.venv/bin/python -m benchmarks.m3_extraction --model qwen3.8:4b --json m3.json
+```
+
+---
+
+## 8. Utilisation
 
 ### Lancer
 
@@ -320,6 +452,10 @@ ollama serve                                  # dans un autre terminal
 | `/context` | Répartition du budget lors du dernier envoi + statistiques de compression |
 | `/summary` | Affiche le résumé des anciens échanges |
 | `/compress` | Force la compression des anciens échanges |
+| `/vocab` | Vocabulaire appris, avec la boîte de Leitner et la date de la prochaine révision |
+| `/vocab del <mot>` | Oublie un mot |
+| `/mistakes` | Erreurs récurrentes, les plus fréquentes d'abord |
+| `/memory` | Bloc mémoire injecté au dernier message |
 | `/quit` | Quitter (Ctrl+D marche aussi) |
 
 Ctrl+C pendant une réponse coupe la génération. La partie déjà reçue est conservée.
@@ -340,6 +476,8 @@ Ctrl+C pendant une réponse coupe la génération. La partie déjà reçue est c
 | `compress_trigger` | `0.8` | Seuil de déclenchement (part de l'historique) |
 | `compress_keep` | `0.4` | Part de l'historique gardée telle quelle (doit être < `compress_trigger`) |
 | `summary_share` | `0.1` | Taille maximale du résumé (part du budget) |
+| `memory` | `true` | Active la mémoire structurée (M3) : extraction et injection |
+| `memory_share` | `0.1` | Taille maximale du bloc mémoire (part du budget). `summary_share + memory_share` doit rester ≤ 0,5 |
 
 Les arguments `--model`, `--host`, `--num-ctx`, `--db`, `--user` et `--config` remplacent les valeurs du fichier.
 
@@ -351,12 +489,14 @@ Les arguments `--model`, `--host`, `--num-ctx`, `--db`, `--user` et `--config` r
 | Modèle absent | Message avec la commande `ollama pull` à lancer |
 | Connexion perdue pendant une réponse | Message d'erreur, le chat continue |
 | Compression échouée (JSON invalide, Ollama indisponible) | Message, vieux messages écartés, nouvel essai 3 tours plus tard |
+| Extraction mémoire échouée | Message, échec journalisé, la conversation continue |
+| Opération mémoire invalide | Rejetée et journalisée, les autres opérations sont appliquées |
 | Entrée vide | Ignorée |
 | `config.json` invalide ou clé inconnue | Message d'erreur, sortie avec le code 2 |
 
 ---
 
-## 8. Interface avec le RAG
+## 9. Interface avec le RAG
 
 Le RAG (géré par un coéquipier) se branche sur `ContextBuilder` via une seule fonction :
 
@@ -375,41 +515,22 @@ Le contrat :
 
 ---
 
-## 9. Prochaines étapes
+## 10. Prochaines étapes
 
-### M3 — Mémoire structurée de l'apprenant
-
-Nouvelles tables dans la même base :
-
-```sql
-vocabulary (user, word, translation, language, correct, wrong, next_review, ...)
-mistakes   (user, pattern, example, count, last_seen, ...)
-```
-
-- **Écriture :** après chaque échange (ou à chaque compression, en réutilisant les champs `vocabulaire` et `erreurs` du résumé), le modèle renvoie en JSON (paramètre `format` d'Ollama avec un schéma) des opérations : ajouter un mot, noter une bonne ou mauvaise réponse, enregistrer une erreur. Le code valide puis applique ces opérations. C'est l'agent qui pilote ses propres créations, lectures, mises à jour et suppressions, comme le demande le sujet.
-- **Révisions espacées :** `next_review` est recalculé selon les bonnes et mauvaises réponses, comme chez Duolingo.
-- **Lecture :** `ContextBuilder` injecte les mots à réviser aujourd'hui et les erreurs les plus fréquentes (part dédiée d'environ 10 % du budget). Le tuteur peut ainsi construire des exercices ciblés.
-
-Répartition du budget visée une fois M3 en place :
-
-| Contenu | Part |
-|---|---|
-| Prompt système + profil | fixe |
-| Mémoire structurée (M3) | ~10 % |
-| Documents RAG | ~25 % |
-| Résumé des anciens tours (M2) | ~10 % |
-| Tours récents | le reste |
-| Réserve pour la réponse | 20 % de `num_ctx` |
-
-Ces parts sont un point de départ, à ajuster avec de vraies mesures.
+- **Mesurer** avec le vrai modèle (`m2_recall.py` et `m3_extraction.py`) et ajuster les consignes données au modèle à partir des réponses détaillées (option `--json`).
+- **Régler les parts du budget** une fois le RAG branché : les valeurs actuelles (10 % mémoire, 10 % résumé, 25 % RAG) sont un point de départ.
+- **M4 (document d'état)**, si le temps le permet : une fiche de progression de l'apprenant, mise à jour section par section, qui pourrait s'appuyer sur les tables de M3.
 
 ---
 
-## 10. Limites actuelles
+## 11. Limites actuelles
 
-- Rien n'a encore été testé avec le vrai modèle, seulement avec un faux serveur Ollama. Les chiffres de rappel restent à mesurer avec `benchmarks/m2_recall.py`.
+- Rien n'a encore été testé avec le vrai modèle, seulement avec un faux serveur Ollama. Les chiffres restent à mesurer avec `benchmarks/m2_recall.py` et `benchmarks/m3_extraction.py`.
 - La qualité du résumé dépend du modèle : un 4B peut rater un fait ou en mal formuler un. Le schéma JSON et la fusion par le code limitent les dégâts sans les supprimer.
 - La compression ajoute un appel au modèle, donc quelques secondes d'attente sur le tour où elle se déclenche.
+- L'extraction M3 ajoute un appel au modèle à chaque échange. Il tourne en arrière-plan, mais si l'apprenant répond très vite, le message suivant attend la fin de l'extraction.
+- Les erreurs sont regroupées par texte exact : si le modèle formule la même erreur de deux façons différentes, elle est comptée deux fois. Lui fournir les erreurs connues limite ce risque sans le supprimer.
+- Leitner ne note que « juste / faux » : il ne distingue pas une réponse hésitante d'une réponse immédiate.
 - La suppression des doublons est textuelle : « neko = chat » et « neko = le chat » restent deux éléments.
 - L'estimation des tokens est approximative. La réserve de 20 % sert de marge de sécurité.
-- Le profil est rempli à la main via `/profile`. Avec M3, le modèle pourra le compléter lui-même.
+- Le modèle peut modifier le profil (`set_profile`) : une mauvaise interprétation peut écraser une valeur. Chaque changement est journalisé dans `memory_ops`, et `/profile set` permet de corriger.

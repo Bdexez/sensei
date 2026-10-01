@@ -23,6 +23,9 @@ class Config:
     compress_trigger: float = 0.8
     compress_keep: float = 0.4
     summary_share: float = 0.1
+    # M3: structured learner memory
+    memory: bool = True
+    memory_share: float = 0.1
 
 
 class ConfigError(Exception):
@@ -58,9 +61,11 @@ def load_config(argv: list[str] | None = None) -> Config:
         if getattr(args, key) is not None:
             values[key] = getattr(args, key)
     config = Config(**values)
-    for key in ("response_reserve", "compress_trigger", "compress_keep", "summary_share"):
+    for key in ("response_reserve", "compress_trigger", "compress_keep", "summary_share", "memory_share"):
         if not 0 < getattr(config, key) < 1:
             raise ConfigError(f"{key} must be between 0 and 1")
     if config.compress_keep >= config.compress_trigger:
         raise ConfigError("compress_keep must be lower than compress_trigger")
+    if config.summary_share + config.memory_share > 0.5:
+        raise ConfigError("summary_share + memory_share must stay under 0.5 to leave room for history and RAG")
     return config

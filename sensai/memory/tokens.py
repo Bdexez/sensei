@@ -10,13 +10,13 @@ those characters are counted separately.
 
 import re
 
-_CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯＀-￯]")
+CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff00-\uffef]")
 CHARS_PER_TOKEN = 3.5  # conservative for latin scripts
 MESSAGE_OVERHEAD = 4  # chat template tokens around each message
 
 
 def estimate_tokens(text: str) -> int:
-    cjk = len(_CJK.findall(text))
+    cjk = len(CJK.findall(text))
     other = len(text) - cjk
     return cjk + int(other / CHARS_PER_TOKEN) + 1
 
