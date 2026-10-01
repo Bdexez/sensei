@@ -1,0 +1,171 @@
+"""Interactive CLI loop."""
+
+import sys
+from datetime import datetime
+
+from .config import Config, ConfigError, load_config
+from .context import ContextBuilder
+from .memory.store import MemoryStore, Message
+from .memory.tokens import estimate_message
+from .ollama_client import ChatStats, ModelNotFound, OllamaClient, OllamaError, OllamaUnavailable
+
+HELP = """Commandes :
+  /help                      cette aide
+  /new                       nouvelle session
+  /sessions                  lister les sessions
+  /load <id>                 reprendre une session
+  /profile                   afficher le profil
+  /profile set <clé> <val>   définir une info (ex. /profile set langue_cible japonais)
+  /profile del <clé>         supprimer une info
+  /context                   détail du dernier contexte envoyé
+  /quit                      quitter"""
+
+
+class Chat:
+    def __init__(self, config: Config, store: MemoryStore, client: OllamaClient):
+        self.config = config
+        self.store = store
+        self.client = client
+        self.context = ContextBuilder(config.system_prompt, config.num_ctx, config.response_reserve)
+        self.session_id = store.create_session(config.user)
+        self.history: list[Message] = []
+        self.last_report = None
+
+    def handle_command(self, line: str) -> bool:
+        """Return False to quit."""
+        parts = line.split(maxsplit=3)
+        cmd = parts[0]
+        user = self.config.user
+        if cmd in ("/quit", "/exit"):
+            return False
+        if cmd == "/help":
+            print(HELP)
+        elif cmd == "/new":
+            self.session_id = self.store.create_session(user)
+            self.history = []
+            print(f"Nouvelle session #{self.session_id}")
+        elif cmd == "/sessions":
+            for s in self.store.list_sessions(user):
+                when = datetime.fromtimestamp(s.updated_at).strftime("%Y-%m-%d %H:%M")
+                mark = "*" if s.id == self.session_id else " "
+                print(f"{mark} #{s.id:<4} {when}  {s.message_count:>3} msg  {s.title or '(vide)'}")
+        elif cmd == "/load":
+            if len(parts) < 2 or not parts[1].isdigit():
+                print("Usage : /load <id>")
+            elif not self.store.session_exists(user, int(parts[1])):
+                print(f"Session #{parts[1]} introuvable")
+            else:
+                self.session_id = int(parts[1])
+                self.history = self.store.load_messages(self.session_id)
+                print(f"Session #{self.session_id} rechargée ({len(self.history)} messages)")
+        elif cmd == "/profile":
+            self._profile(parts[1:])
+        elif cmd == "/context":
+            self._print_report()
+        else:
+            print(f"Commande inconnue : {cmd} (voir /help)")
+        return True
+
+    def _profile(self, args: list[str]) -> None:
+        user = self.config.user
+        if not args:
+            profile = self.store.get_profile(user)
+            if not profile:
+                print("Profil vide. Ex. : /profile set langue_cible espagnol")
+            for k, v in profile.items():
+                print(f"  {k}: {v}")
+        elif args[0] == "set" and len(args) == 3:
+            self.store.set_profile(user, args[1], args[2])
+            print(f"{args[1]} = {args[2]}")
+        elif args[0] == "del" and len(args) == 2:
+            print("Supprimé" if self.store.delete_profile_key(user, args[1]) else "Clé absente")
+        else:
+            print("Usage : /profile | /profile set <clé> <valeur> | /profile del <clé>")
+
+    def _print_report(self) -> None:
+        r = self.last_report
+        if r is None:
+            print("Aucun message envoyé pour l'instant.")
+            return
+        print(
+            f"Budget {r.used}/{r.budget} tokens (estimés) — système+profil {r.system_tokens}, "
+            f"RAG {r.rag_tokens}, historique {r.history_tokens} "
+            f"({r.history_kept} messages gardés, {r.history_dropped} écartés)"
+        )
+
+    def send(self, text: str) -> None:
+        user_msg = Message("user", text, estimate_message(text))
+        self.history.append(user_msg)
+        self.store.add_message(self.session_id, user_msg)
+
+        messages, self.last_report = self.context.build(self.store.get_profile(self.config.user), self.history)
+        if self.last_report.history_dropped:
+            print(f"[{self.last_report.history_dropped} anciens messages hors contexte]", file=sys.stderr)
+
+        stats = ChatStats()
+        parts: list[str] = []
+        try:
+            for piece in self.client.chat_stream(messages, stats):
+                print(piece, end="", flush=True)
+                parts.append(piece)
+        except KeyboardInterrupt:
+            print("\n[génération interrompue]")
+        finally:
+            print()
+        answer = "".join(parts)
+        if answer:
+            msg = Message("assistant", answer, stats.eval_count or estimate_message(answer))
+            self.history.append(msg)
+            self.store.add_message(self.session_id, msg)
+
+
+def run(config: Config) -> int:
+    client = OllamaClient(config.host, config.model, config.num_ctx, config.think)
+    try:
+        client.check()
+    except OllamaError as exc:
+        print(f"Erreur : {exc}", file=sys.stderr)
+        return 1
+
+    store = MemoryStore(config.db_path)
+    chat = Chat(config, store, client)
+    profile = store.get_profile(config.user)
+    print(f"Sensai — modèle {config.model}, apprenant « {config.user} », session #{chat.session_id}")
+    if not profile:
+        print("Astuce : renseigne ton profil, ex. /profile set langue_cible japonais")
+    print("/help pour les commandes.\n")
+
+    try:
+        while True:
+            try:
+                line = input("> ").strip()
+            except EOFError:
+                break
+            if not line:
+                continue
+            if line.startswith("/"):
+                if not chat.handle_command(line):
+                    break
+                continue
+            try:
+                chat.send(line)
+            except ModelNotFound as exc:
+                print(f"Erreur : {exc}", file=sys.stderr)
+            except OllamaUnavailable as exc:
+                print(f"Erreur : {exc} — réessaie quand Ollama est relancé.", file=sys.stderr)
+            except OllamaError as exc:
+                print(f"Erreur du modèle : {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        store.close()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        config = load_config(argv)
+    except ConfigError as exc:
+        print(f"Erreur de configuration : {exc}", file=sys.stderr)
+        return 2
+    return run(config)
