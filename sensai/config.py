@@ -26,6 +26,10 @@ class Config:
     # M3: structured learner memory
     memory: bool = True
     memory_share: float = 0.1
+    # EV3: structured logging & monitoring
+    log_path: str = "data/logs/sensai.jsonl"
+    log_content_chars: int = 120  # longest text excerpt kept in a log event (0 = lengths only)
+    log_max_bytes: int = 5_000_000  # rotate the log file past this size
 
 
 class ConfigError(Exception):
@@ -66,6 +70,8 @@ def load_config(argv: list[str] | None = None) -> Config:
             raise ConfigError(f"{key} must be between 0 and 1")
     if config.compress_keep >= config.compress_trigger:
         raise ConfigError("compress_keep must be lower than compress_trigger")
+    if config.log_content_chars < 0 or config.log_max_bytes < 0:
+        raise ConfigError("log_content_chars and log_max_bytes must be positive")
     if config.summary_share + config.memory_share > 0.5:
         raise ConfigError("summary_share + memory_share must stay under 0.5 to leave room for history and RAG")
     return config

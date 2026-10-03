@@ -87,6 +87,7 @@ class MemoryExtractor:
                 ChatStats(),
                 schema=SCHEMA,
                 options={"temperature": 0},
+                purpose="memory_extraction",
             )
         except OllamaError as exc:
             raise ExtractionError(str(exc)) from exc

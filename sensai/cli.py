@@ -11,6 +11,8 @@ from .memory.extractor import ExtractionError, MemoryExtractor
 from .memory.learner import LearnerMemory
 from .memory.store import MemoryStore, Message
 from .memory.tokens import estimate_message
+from .monitoring import compute_metrics, load_events, render_metrics
+from .observability import EventLogger, new_interaction_id
 from .ollama_client import ChatStats, ModelNotFound, OllamaClient, OllamaError, OllamaUnavailable
 
 HELP = """Commandes :
@@ -28,12 +30,14 @@ HELP = """Commandes :
   /vocab del <mot>           oublier un mot
   /mistakes                  erreurs récurrentes
   /memory                    bloc mémoire injecté au dernier message
+  /metrics                   métriques du système (latence, tokens, erreurs, outils…)
   /quit                      quitter"""
 
 
 class Chat:
-    def __init__(self, config: Config, store: MemoryStore, client: OllamaClient):
+    def __init__(self, config: Config, store: MemoryStore, client: OllamaClient, logger: EventLogger | None = None):
         self.config = config
+        self.logger = logger or client.logger
         self.store = store
         self.client = client
         self.context = ContextBuilder(
@@ -129,6 +133,8 @@ class Chat:
                 print(f"  {m.line()}")
         elif cmd == "/memory":
             print(self.last_memory or "Aucun bloc mémoire injecté au dernier message.")
+        elif cmd == "/metrics":
+            print(render_metrics(compute_metrics(load_events(self.config.log_path))))
         else:
             print(f"Commande inconnue : {cmd} (voir /help)")
         return True
@@ -231,6 +237,11 @@ class Chat:
         )
 
     def send(self, text: str) -> None:
+        interaction_id = new_interaction_id()
+        with self.logger.timed("chat_turn", interaction_id, session_id=self.session_id, input_chars=len(text)) as ev:
+            self._send(text, interaction_id, ev)
+
+    def _send(self, text: str, interaction_id: str, ev: dict) -> None:
         self._apply_pending()
         user_msg = Message("user", text, estimate_message(text))
         self.history.append(user_msg)
@@ -256,14 +267,20 @@ class Chat:
         stats = ChatStats()
         parts: list[str] = []
         try:
-            for piece in self.client.chat_stream(messages, stats):
+            for piece in self.client.chat_stream(messages, stats, interaction_id=interaction_id):
                 print(piece, end="", flush=True)
                 parts.append(piece)
         except KeyboardInterrupt:
             print("\n[génération interrompue]")
+            ev["status"] = "interrupted"
         finally:
             print()
         answer = "".join(parts)
+        ev.update(
+            context_tokens=self.last_report.used,
+            history_dropped=self.last_report.history_dropped,
+            output_chars=len(answer),
+        )
         if answer:
             msg = Message("assistant", answer, stats.eval_count or estimate_message(answer))
             self.history.append(msg)
@@ -273,7 +290,8 @@ class Chat:
 
 
 def run(config: Config) -> int:
-    client = OllamaClient(config.host, config.model, config.num_ctx, config.think)
+    logger = EventLogger(config.log_path, config.log_content_chars, config.log_max_bytes)
+    client = OllamaClient(config.host, config.model, config.num_ctx, config.think, logger=logger)
     try:
         client.check()
     except OllamaError as exc:
@@ -281,7 +299,7 @@ def run(config: Config) -> int:
         return 1
 
     store = MemoryStore(config.db_path)
-    chat = Chat(config, store, client)
+    chat = Chat(config, store, client, logger)
     profile = store.get_profile(config.user)
     print(f"Sensai — modèle {config.model}, apprenant « {config.user} », session #{chat.session_id}")
     if not profile:

@@ -1,10 +1,13 @@
 """Minimal streaming client for the Ollama HTTP API (/api/chat)."""
 
 import json
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 
 import requests
+
+from .observability import EventLogger, NullLogger
 
 
 class OllamaError(Exception):
@@ -29,12 +32,43 @@ class ChatStats:
 
 
 class OllamaClient:
-    def __init__(self, host: str, model: str, num_ctx: int, think: bool | None = None, timeout: float = 300):
+    def __init__(
+        self,
+        host: str,
+        model: str,
+        num_ctx: int,
+        think: bool | None = None,
+        timeout: float = 300,
+        logger: EventLogger | None = None,
+    ):
         self.host = host.rstrip("/")
         self.model = model
         self.num_ctx = num_ctx
         self.think = think
         self.timeout = timeout
+        self.logger = logger or NullLogger()
+
+    def _log_call(
+        self, purpose: str, interaction_id: str | None, start: float, stats: ChatStats, error: Exception | None
+    ) -> None:
+        """EV3: one `model_call` event per request, success or not (no prompt or answer content)."""
+        status = "ok"
+        if isinstance(error, requests.Timeout) or "timed out" in str(error or ""):
+            status = "timeout"
+        elif error is not None:
+            status = "error"
+        self.logger.log(
+            "model_call",
+            interaction_id,
+            model=self.model,
+            purpose=purpose,
+            status=status,
+            error=f"{type(error).__name__}: {error}" if error else None,
+            duration_ms=round((time.perf_counter() - start) * 1000, 1),
+            prompt_tokens=stats.prompt_eval_count,
+            output_tokens=stats.eval_count,
+            model_duration_ms=round(stats.total_duration_ms, 1),
+        )
 
     def check(self) -> None:
         """Fail early if the server is down or the model is not pulled."""
@@ -58,8 +92,27 @@ class OllamaClient:
             payload["think"] = self.think
         return payload
 
-    def chat(self, messages: list[dict], stats: ChatStats, schema: dict | None = None, options: dict | None = None) -> str:
+    def chat(
+        self,
+        messages: list[dict],
+        stats: ChatStats,
+        schema: dict | None = None,
+        options: dict | None = None,
+        purpose: str = "chat",
+        interaction_id: str | None = None,
+    ) -> str:
         """Non-streaming call; with `schema`, Ollama constrains the output to that JSON schema."""
+        start = time.perf_counter()
+        error: Exception | None = None
+        try:
+            return self._chat(messages, stats, schema, options)
+        except Exception as exc:
+            error = exc
+            raise
+        finally:
+            self._log_call(purpose, interaction_id, start, stats, error)
+
+    def _chat(self, messages: list[dict], stats: ChatStats, schema: dict | None, options: dict | None) -> str:
         payload = self._payload(messages, stream=False, options=options)
         if schema is not None:
             payload["format"] = schema
@@ -80,8 +133,24 @@ class OllamaClient:
         stats.total_duration_ms = data.get("total_duration", 0) / 1e6
         return data.get("message", {}).get("content", "")
 
-    def chat_stream(self, messages: list[dict], stats: ChatStats) -> Iterator[str]:
+    def chat_stream(
+        self, messages: list[dict], stats: ChatStats, purpose: str = "chat", interaction_id: str | None = None
+    ) -> Iterator[str]:
         """Yield response text pieces as they arrive; fill `stats` when done."""
+        start = time.perf_counter()
+        error: Exception | None = None
+        try:
+            yield from self._chat_stream(messages, stats)
+        except (GeneratorExit, KeyboardInterrupt):
+            error = InterruptedError("generation interrupted")
+            raise
+        except Exception as exc:
+            error = exc
+            raise
+        finally:
+            self._log_call(purpose, interaction_id, start, stats, error)
+
+    def _chat_stream(self, messages: list[dict], stats: ChatStats) -> Iterator[str]:
         payload = self._payload(messages, stream=True)
         try:
             resp = requests.post(f"{self.host}/api/chat", json=payload, stream=True, timeout=self.timeout)

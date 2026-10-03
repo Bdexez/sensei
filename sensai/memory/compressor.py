@@ -200,6 +200,7 @@ class Compressor:
                 ChatStats(),
                 schema=SCHEMA,
                 options={"temperature": 0},
+                purpose="compression",
             )
         except OllamaError as exc:
             raise CompressionError(str(exc)) from exc
