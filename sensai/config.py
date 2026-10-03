@@ -41,6 +41,9 @@ class Config:
     sandbox_max_output: int = 8000
     sandbox_memory_mb: int = 256
     sandbox_docker_image: str = "python:3.12-alpine"
+    # A3: human-in-the-loop ("write" and "delete" are always confirmed)
+    confirm_actions: list[str] = field(default_factory=lambda: ["write", "delete", "execute"])
+    confirm_timeout: float = 300.0  # seconds without an answer = refusal (0 = wait forever)
     # EV3: structured logging & monitoring
     log_path: str = "data/logs/sensai.jsonl"
     log_content_chars: int = 120  # longest text excerpt kept in a log event (0 = lengths only)
@@ -93,6 +96,11 @@ def load_config(argv: list[str] | None = None) -> Config:
         raise ConfigError('sandbox_backend must be "subprocess" or "docker"')
     if config.sandbox_timeout <= 0 or config.sandbox_max_output <= 0 or config.sandbox_memory_mb <= 0:
         raise ConfigError("sandbox_timeout, sandbox_max_output and sandbox_memory_mb must be positive")
+    unknown_levels = set(config.confirm_actions) - {"read", "write", "delete", "execute"}
+    if unknown_levels:
+        raise ConfigError(f"confirm_actions: unknown levels {sorted(unknown_levels)}")
+    if config.confirm_timeout < 0:
+        raise ConfigError("confirm_timeout must be positive (0 = no timeout)")
     if config.log_content_chars < 0 or config.log_max_bytes < 0:
         raise ConfigError("log_content_chars and log_max_bytes must be positive")
     if config.summary_share + config.memory_share > 0.5:
