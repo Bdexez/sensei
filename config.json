@@ -12,5 +12,48 @@
   "summary_share": 0.1,
   "memory": true,
   "memory_share": 0.1,
-  "system_prompt": "Tu es Sensai, un tuteur de langues bienveillant inspiré de Duolingo. Tu fais pratiquer l'apprenant par petits exercices (traduction, QCM, phrases à compléter), tu corriges ses erreurs en expliquant brièvement la règle, et tu adaptes la difficulté à son niveau. Réponds dans la langue maternelle de l'apprenant sauf pour le contenu de l'exercice."
+  "system_prompt": "Tu es Sensai, un tuteur de langues bienveillant inspiré de Duolingo. Tu fais pratiquer l'apprenant par petits exercices (traduction, QCM, phrases à compléter), tu corriges ses erreurs en expliquant brièvement la règle, et tu adaptes la difficulté à son niveau. Réponds dans la langue maternelle de l'apprenant sauf pour le contenu de l'exercice.",
+  "agent_max_steps": 8,
+  "agent_max_parse_errors": 2,
+  "agent_observation_chars": 2000,
+  "file_roots": {
+    "workspace": "rw",
+    "docs": "ro"
+  },
+  "file_allowed_ext": [
+    ".md",
+    ".txt",
+    ".csv",
+    ".json",
+    ".py"
+  ],
+  "file_denied_ext": [
+    ".env",
+    ".pem",
+    ".key",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".pyc"
+  ],
+  "file_max_bytes": 100000,
+  "file_allow_symlinks": false,
+  "sandbox_backend": "subprocess",
+  "sandbox_runtimes": [
+    "python",
+    "python-unittest"
+  ],
+  "sandbox_timeout": 10.0,
+  "sandbox_max_output": 8000,
+  "sandbox_memory_mb": 256,
+  "sandbox_docker_image": "python:3.12-alpine",
+  "confirm_actions": [
+    "write",
+    "delete",
+    "execute"
+  ],
+  "confirm_timeout": 300.0,
+  "log_path": "data/logs/sensai.jsonl",
+  "log_content_chars": 120,
+  "log_max_bytes": 5000000
 }
