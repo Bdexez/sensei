@@ -4,6 +4,11 @@ import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 
+from .agent.approval import ApprovalGate, ConsoleApprover
+from .agent.permissions import FileGuard
+from .agent.react import AgentResult, ReActAgent, Step
+from .agent.sandbox import Sandbox
+from .agent.tools import ToolRegistry
 from .config import Config, ConfigError, load_config
 from .context import ContextBuilder
 from .memory.compressor import CompressionError, Compressor, Summary, compress
@@ -30,14 +35,27 @@ HELP = """Commandes :
   /vocab del <mot>           oublier un mot
   /mistakes                  erreurs récurrentes
   /memory                    bloc mémoire injecté au dernier message
+  /agent <tâche>             mode agent : l'agent lit/écrit dans le workspace et exécute du code
+                             en sandbox, étape par étape (confirmation avant toute modification)
+  /trace                     étapes de la dernière tâche agent
+  /tools                     outils de l'agent, permissions et limites
   /metrics                   métriques du système (latence, tokens, erreurs, outils…)
   /quit                      quitter"""
 
 
 class Chat:
-    def __init__(self, config: Config, store: MemoryStore, client: OllamaClient, logger: EventLogger | None = None):
+    def __init__(
+        self,
+        config: Config,
+        store: MemoryStore,
+        client: OllamaClient,
+        logger: EventLogger | None = None,
+        agent: ReActAgent | None = None,
+    ):
         self.config = config
         self.logger = logger or client.logger
+        self.agent = agent
+        self.last_agent: AgentResult | None = None
         self.store = store
         self.client = client
         self.context = ContextBuilder(
@@ -133,6 +151,23 @@ class Chat:
                 print(f"  {m.line()}")
         elif cmd == "/memory":
             print(self.last_memory or "Aucun bloc mémoire injecté au dernier message.")
+        elif cmd == "/agent":
+            task = line[len("/agent"):].strip()
+            if not task:
+                print("Usage : /agent <tâche>   ex. /agent crée une fiche de révision à partir de docs/lecon.md")
+            else:
+                self.run_agent(task)
+        elif cmd == "/trace":
+            print(self.last_agent.trace() if self.last_agent else "Aucune tâche agent pour l'instant.")
+        elif cmd == "/tools":
+            if self.agent is None:
+                print("Mode agent indisponible.")
+            else:
+                print(self.agent.tools.describe())
+                print(self.agent.tools.guard.describe())
+                print(self.agent.tools.sandbox.describe())
+                levels = ", ".join(sorted(self.agent.tools.gate.levels))
+                print(f"Confirmation demandée pour : {levels}. Étapes max : {self.agent.max_steps}.")
         elif cmd == "/metrics":
             print(render_metrics(compute_metrics(load_events(self.config.log_path))))
         else:
@@ -236,6 +271,30 @@ class Chat:
             self.extractor.extract, user_text, answer, profile, known_words, known_mistakes
         )
 
+    def run_agent(self, task: str) -> AgentResult | None:
+        """A1: run the ReAct loop on `task`; the exchange is kept in the chat history."""
+        if self.agent is None:
+            print("Mode agent indisponible.")
+            return None
+        self._apply_pending()
+        profile = self.store.get_profile(self.config.user)
+        context = ("Profil de l'apprenant : " + ", ".join(f"{k} = {v}" for k, v in profile.items())) if profile else None
+        print(f"[agent — {self.agent.max_steps} étapes max, Ctrl-C pour interrompre]")
+        try:
+            result = self.agent.run(task, context)
+        except KeyboardInterrupt:
+            print("\n[agent interrompu]")
+            return None
+        self.last_agent = result
+        label = {"done": "terminé", "max_steps": "limite d'étapes atteinte", "error": "arrêté sur erreur"}[result.outcome]
+        print(f"\n[agent {label} — {len(result.steps)} étapes, {result.duration_ms / 1000:.1f} s, /trace pour le détail]")
+        print(result.answer)
+        for role, content in (("user", f"[tâche agent] {task}"), ("assistant", result.answer)):
+            msg = Message(role, content, estimate_message(content))
+            self.history.append(msg)
+            self.store.add_message(self.session_id, msg)
+        return result
+
     def send(self, text: str) -> None:
         interaction_id = new_interaction_id()
         with self.logger.timed("chat_turn", interaction_id, session_id=self.session_id, input_chars=len(text)) as ev:
@@ -289,6 +348,49 @@ class Chat:
                 self._start_extraction(text, answer)
 
 
+def print_step(step: Step) -> None:
+    print(step.line(), flush=True)
+    error = step.observation.get("error")
+    if error and step.status != "ok":
+        print(f"           {error}")
+    elif "outcome" in step.observation:
+        out = (step.observation.get("stdout") or step.observation.get("stderr") or "").strip().splitlines()
+        tail = f" — {out[-1][:100]}" if out else ""
+        print(f"           sandbox : {step.observation['outcome']}, code {step.observation.get('exit_code')}{tail}")
+
+
+def build_agent(config: Config, client: OllamaClient, logger: EventLogger, budget: int) -> ReActAgent:
+    """Wire the ReAct loop to its tools: permissions (T4), sandbox (T2), confirmation (A3), logs (EV3)."""
+    guard = FileGuard(
+        config.file_roots,
+        allowed_ext=config.file_allowed_ext,
+        denied_ext=config.file_denied_ext,
+        max_bytes=config.file_max_bytes,
+        allow_symlinks=config.file_allow_symlinks,
+        logger=logger,
+    )
+    sandbox = Sandbox(
+        runtimes=config.sandbox_runtimes,
+        timeout=config.sandbox_timeout,
+        max_output=config.sandbox_max_output,
+        memory_mb=config.sandbox_memory_mb,
+        backend=config.sandbox_backend,
+        docker_image=config.sandbox_docker_image,
+        logger=logger,
+    )
+    gate = ApprovalGate(ConsoleApprover(timeout=config.confirm_timeout), config.confirm_actions, logger)
+    return ReActAgent(
+        client,
+        ToolRegistry(guard, sandbox, gate, logger),
+        logger,
+        max_steps=config.agent_max_steps,
+        max_parse_errors=config.agent_max_parse_errors,
+        observation_chars=config.agent_observation_chars,
+        token_budget=budget,
+        on_step=print_step,
+    )
+
+
 def run(config: Config) -> int:
     logger = EventLogger(config.log_path, config.log_content_chars, config.log_max_bytes)
     client = OllamaClient(config.host, config.model, config.num_ctx, config.think, logger=logger)
@@ -300,6 +402,10 @@ def run(config: Config) -> int:
 
     store = MemoryStore(config.db_path)
     chat = Chat(config, store, client, logger)
+    try:
+        chat.agent = build_agent(config, client, logger, chat.context.budget)
+    except (ValueError, OSError) as exc:
+        print(f"Mode agent désactivé : {exc}", file=sys.stderr)
     profile = store.get_profile(config.user)
     print(f"Sensai — modèle {config.model}, apprenant « {config.user} », session #{chat.session_id}")
     if not profile:

@@ -26,6 +26,10 @@ class Config:
     # M3: structured learner memory
     memory: bool = True
     memory_share: float = 0.1
+    # A1: ReAct agent (/agent)
+    agent_max_steps: int = 8
+    agent_max_parse_errors: int = 2
+    agent_observation_chars: int = 2000
     # T4: file access within permissions (paths relative to the working directory)
     file_roots: dict[str, str] = field(default_factory=lambda: {"workspace": "rw", "docs": "ro"})
     file_allowed_ext: list[str] = field(default_factory=lambda: [".md", ".txt", ".csv", ".json", ".py"])
@@ -88,6 +92,8 @@ def load_config(argv: list[str] | None = None) -> Config:
             raise ConfigError(f"{key} must be between 0 and 1")
     if config.compress_keep >= config.compress_trigger:
         raise ConfigError("compress_keep must be lower than compress_trigger")
+    if config.agent_max_steps < 1 or config.agent_max_parse_errors < 0 or config.agent_observation_chars < 100:
+        raise ConfigError("agent_max_steps >= 1, agent_max_parse_errors >= 0, agent_observation_chars >= 100")
     if not isinstance(config.file_roots, dict) or any(m not in ("ro", "rw") for m in config.file_roots.values()):
         raise ConfigError('file_roots must map directories to "ro" or "rw"')
     if config.file_max_bytes <= 0:

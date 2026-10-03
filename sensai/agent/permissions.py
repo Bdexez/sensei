@@ -37,6 +37,16 @@ class PermissionDenied(Exception):
         self.reason = reason
 
 
+class FileOperationError(Exception):
+    """The operation was allowed but failed (missing file, binary content...)."""
+
+    def __init__(self, op: str, path: str, reason: str):
+        super().__init__(f"{op} {path!r} impossible : {reason}")
+        self.op = op
+        self.path = path
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class Root:
     name: str  # as configured, shown to the model
@@ -89,7 +99,7 @@ class FileGuard:
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            self._deny("read", path, "fichier binaire ou non UTF-8")
+            self._fail("read", path, "fichier binaire ou non UTF-8")
         self._allow("read", path, bytes=len(data))
         return text
 
@@ -100,7 +110,7 @@ class FileGuard:
             return [Entry(r.name, True, 0) for r in self.roots]
         target = self.check("list", path, is_dir=True)
         if not target.is_dir():
-            self._deny("list", path, "n'est pas un répertoire")
+            self._fail("list", path, "n'est pas un répertoire")
         entries = []
         for child in sorted(target.iterdir()):
             if child.name.startswith(".") or (child.is_symlink() and not self.allow_symlinks):
@@ -117,9 +127,9 @@ class FileGuard:
         if len(data) > self.max_bytes:
             self._deny(op, path, f"contenu trop gros ({len(data)} o > {self.max_bytes} o)")
         if exists and not overwrite:
-            self._deny(op, path, "le fichier existe déjà")
+            self._fail(op, path, "le fichier existe déjà")
         if not target.parent.is_dir():
-            self._deny(op, path, "le répertoire parent n'existe pas")
+            self._fail(op, path, "le répertoire parent n'existe pas")
         tmp = target.with_name(f".{target.name}.sensai-tmp")
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
@@ -128,14 +138,14 @@ class FileGuard:
             os.replace(tmp, target)  # atomic: a reader never sees half a file
         except OSError as exc:
             tmp.unlink(missing_ok=True)
-            self._deny(op, path, f"erreur d'écriture ({exc.strerror})")
+            self._fail(op, path, f"erreur d'écriture ({exc.strerror})")
         self._allow(op, path, bytes=len(data))
         return len(data)
 
     def delete(self, path: str) -> None:
         target = self.check("delete", path)
         if not target.is_file():
-            self._deny("delete", path, "fichier introuvable (seuls les fichiers peuvent être supprimés)")
+            self._fail("delete", path, "fichier introuvable (seuls les fichiers peuvent être supprimés)")
         target.unlink()
         self._allow("delete", path)
 
@@ -233,10 +243,10 @@ class FileGuard:
     def _size(self, target: Path, op: str, path: str) -> int:
         try:
             if not target.is_file():
-                self._deny(op, path, "fichier introuvable")
+                self._fail(op, path, "fichier introuvable")
             return target.stat().st_size
         except OSError as exc:
-            self._deny(op, path, f"inaccessible ({exc.strerror})")
+            self._fail(op, path, f"inaccessible ({exc.strerror})")
 
     def _open_read(self, target: Path, op: str, path: str) -> bytes:
         try:
@@ -244,11 +254,15 @@ class FileGuard:
             with os.fdopen(fd, "rb") as f:
                 return f.read(self.max_bytes + 1)[: self.max_bytes]
         except OSError as exc:
-            self._deny(op, path, f"lecture impossible ({exc.strerror})")
+            self._fail(op, path, f"lecture impossible ({exc.strerror})")
 
     def _allow(self, op: str, path: str, **fields) -> None:
         self.logger.log("file_access", op=op, path=path, allowed=True, **fields)
 
+    def _fail(self, op: str, path: str, reason: str):
+        self.logger.log("file_access", op=op, path=path, allowed=True, status="error", reason=reason)
+        raise FileOperationError(op, path, reason)
+
     def _deny(self, op: str, path: str, reason: str):
-        self.logger.log("file_access", op=op, path=path, allowed=False, reason=reason)
+        self.logger.log("file_access", op=op, path=path, allowed=False, status="denied", reason=reason)
         raise PermissionDenied(op, path, reason)

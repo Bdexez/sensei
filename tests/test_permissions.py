@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sensai.agent.permissions import FileGuard, PermissionDenied
+from sensai.agent.permissions import FileGuard, FileOperationError, PermissionDenied
 from sensai.monitoring import load_events
 from sensai.observability import EventLogger
 
@@ -31,8 +31,8 @@ class FileGuardTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def assertDenied(self, fn, *args, reason=""):
-        with self.assertRaises(PermissionDenied) as ctx:
+    def assertDenied(self, fn, *args, reason="", error=PermissionDenied):
+        with self.assertRaises(error) as ctx:
             fn(*args)
         self.assertIn(reason, ctx.exception.reason)
         return ctx.exception
@@ -66,7 +66,7 @@ class FileGuardTest(unittest.TestCase):
 
     def test_no_overwrite(self):
         self.guard.write_text("workspace/a.md", "x")
-        self.assertDenied(self.guard.write_text, "workspace/a.md", "y", False, reason="existe déjà")
+        self.assertDenied(self.guard.write_text, "workspace/a.md", "y", False, reason="existe déjà", error=FileOperationError)
 
     # --- refusals -------------------------------------------------------
 
@@ -112,10 +112,12 @@ class FileGuardTest(unittest.TestCase):
 
     def test_binary_and_missing(self):
         (self.base / "docs" / "bin.txt").write_bytes(b"\xff\xfe\x00")
-        self.assertDenied(self.guard.read_text, "docs/bin.txt", reason="binaire")
-        self.assertDenied(self.guard.read_text, "docs/absent.md", reason="introuvable")
-        self.assertDenied(self.guard.delete, "workspace/absent.md", reason="introuvable")
-        self.assertDenied(self.guard.write_text, "workspace/no/dir.md", "x", reason="parent")
+        failed = FileOperationError
+        self.assertDenied(self.guard.read_text, "docs/bin.txt", reason="binaire", error=failed)
+        self.assertDenied(self.guard.read_text, "docs/absent.md", reason="introuvable", error=failed)
+        self.assertDenied(self.guard.delete, "workspace/absent.md", reason="introuvable", error=failed)
+        self.assertDenied(self.guard.write_text, "workspace/no/dir.md", "x", reason="parent", error=failed)
+        self.assertDenied(self.guard.list_dir, "docs/cours.md", reason="répertoire", error=failed)
 
     # --- symlinks -------------------------------------------------------
 
