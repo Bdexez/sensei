@@ -34,6 +34,13 @@ class Config:
     )
     file_max_bytes: int = 100_000
     file_allow_symlinks: bool = False
+    # T2: sandboxed code execution
+    sandbox_backend: str = "subprocess"  # or "docker" (stronger isolation, needs a running daemon)
+    sandbox_runtimes: list[str] = field(default_factory=lambda: ["python", "python-unittest"])
+    sandbox_timeout: float = 10.0
+    sandbox_max_output: int = 8000
+    sandbox_memory_mb: int = 256
+    sandbox_docker_image: str = "python:3.12-alpine"
     # EV3: structured logging & monitoring
     log_path: str = "data/logs/sensai.jsonl"
     log_content_chars: int = 120  # longest text excerpt kept in a log event (0 = lengths only)
@@ -82,6 +89,10 @@ def load_config(argv: list[str] | None = None) -> Config:
         raise ConfigError('file_roots must map directories to "ro" or "rw"')
     if config.file_max_bytes <= 0:
         raise ConfigError("file_max_bytes must be positive")
+    if config.sandbox_backend not in ("subprocess", "docker"):
+        raise ConfigError('sandbox_backend must be "subprocess" or "docker"')
+    if config.sandbox_timeout <= 0 or config.sandbox_max_output <= 0 or config.sandbox_memory_mb <= 0:
+        raise ConfigError("sandbox_timeout, sandbox_max_output and sandbox_memory_mb must be positive")
     if config.log_content_chars < 0 or config.log_max_bytes < 0:
         raise ConfigError("log_content_chars and log_max_bytes must be positive")
     if config.summary_share + config.memory_share > 0.5:
